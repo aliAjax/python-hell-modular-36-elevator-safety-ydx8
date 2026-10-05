@@ -84,6 +84,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "offline-records"]:
+                    query = parse_qs(parsed.query)
+                    status = query.get("status", [None])[0]
+                    return self._send(200, {"items": service.list_offline_records(status=status)})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -117,6 +121,11 @@ def create_handler(service, rules, static_dir):
                     action = body.pop("action", None)
                     if not action:
                         raise ValidationError("action is required")
+                    if action == "resolve_offline_conflict":
+                        choice = body.get("choice")
+                        if choice is None:
+                            choice = (body.get("data") or {}).get("choice")
+                        return self._send(200, service.resolve_conflict(actor, parts[2], choice))
                     return self._send(
                         200,
                         service.transition(

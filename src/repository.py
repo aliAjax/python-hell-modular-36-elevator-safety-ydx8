@@ -54,6 +54,24 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS offline_records (
+                    source_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    entity_id TEXT,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    result TEXT,
+                    error TEXT,
+                    content_hash TEXT,
+                    base_version INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(source_id, record_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_offline_records_entity
+                    ON offline_records(entity_id);
             """)
 
     @staticmethod
@@ -198,6 +216,92 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def get_offline_record(self, source_id, record_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM offline_records WHERE source_id = ? AND record_id = ?",
+                (source_id, record_id),
+            ).fetchone()
+        return self._offline_from_row(row) if row else None
+
+    def get_offline_record_by_entity(self, entity_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM offline_records WHERE entity_id = ? ORDER BY created_at LIMIT 1",
+                (entity_id,),
+            ).fetchone()
+        return self._offline_from_row(row) if row else None
+
+    def list_offline_records(self, status=None):
+        clauses = []
+        params = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM offline_records" + where + " ORDER BY created_at, source_id, record_id",
+                params,
+            ).fetchall()
+        return [self._offline_from_row(row) for row in rows]
+
+    def save_offline_record(self, record):
+        now = utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO offline_records(
+                    source_id, record_id, kind, entity_id, status, payload, result,
+                    error, content_hash, base_version, attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id, record_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    entity_id = excluded.entity_id,
+                    status = excluded.status,
+                    payload = excluded.payload,
+                    result = excluded.result,
+                    error = excluded.error,
+                    content_hash = excluded.content_hash,
+                    base_version = excluded.base_version,
+                    attempts = excluded.attempts,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record["source_id"],
+                    record["record_id"],
+                    record.get("kind", ""),
+                    record.get("entity_id"),
+                    record["status"],
+                    json.dumps(record.get("payload", {}), ensure_ascii=False, sort_keys=True),
+                    json.dumps(record["result"], ensure_ascii=False, sort_keys=True) if record.get("result") is not None else None,
+                    record.get("error"),
+                    record.get("content_hash"),
+                    record.get("base_version"),
+                    int(record.get("attempts", 0)),
+                    record.get("created_at") or now,
+                    now,
+                ),
+            )
+
+    @staticmethod
+    def _offline_from_row(row):
+        return {
+            "source_id": row["source_id"],
+            "record_id": row["record_id"],
+            "kind": row["kind"],
+            "entity_id": row["entity_id"],
+            "status": row["status"],
+            "payload": json.loads(row["payload"]),
+            "result": json.loads(row["result"]) if row["result"] is not None else None,
+            "error": row["error"],
+            "content_hash": row["content_hash"],
+            "base_version": row["base_version"],
+            "attempts": int(row["attempts"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def ping(self):
         with self._connect() as connection:
