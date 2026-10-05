@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -18,6 +19,19 @@ class SQLiteRepository:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @contextmanager
+    def transaction(self):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _initialize(self):
         with self._connect() as connection:
@@ -54,6 +68,19 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS offline_inbox (
+                    record_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    entity_id TEXT,
+                    status TEXT NOT NULL,
+                    envelope TEXT NOT NULL,
+                    result TEXT,
+                    error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    submitted_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
             """)
 
     @staticmethod
@@ -69,16 +96,60 @@ class SQLiteRepository:
             "updated_at": row["updated_at"],
         }
 
-    def create_entity(self, entity_id, kind, status, data, actor_id):
+    def _row_to_entity(self, connection, entity_id):
+        row = connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return self._entity_from_row(row) if row else None
+
+    def insert_entity(self, connection, entity_id, kind, status, data, actor_id):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
+        connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+            (entity_id, kind, status, payload, actor_id, now, now),
+        )
+        return self._row_to_entity(connection, entity_id)
+
+    def apply_entity(self, connection, entity_id, status, data, bump_version=True):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        if bump_version:
             connection.execute(
-                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ?",
+                (status, payload, now, entity_id),
             )
-        return self.get_entity(entity_id)
+        else:
+            connection.execute(
+                "UPDATE entities SET status = ?, data = ?, updated_at = ? WHERE id = ?",
+                (status, payload, now, entity_id),
+            )
+        return self._row_to_entity(connection, entity_id)
+
+    def append_audit_conn(
+        self, connection, entity_id, actor_id, actor_role, action, from_status, to_status, detail
+    ):
+        connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
+    def create_entity(self, entity_id, kind, status, data, actor_id):
+        with self.transaction() as connection:
+            entity = self.insert_entity(connection, entity_id, kind, status, data, actor_id)
+        return entity
 
     def get_entity(self, entity_id):
         with self._connect() as connection:
@@ -198,6 +269,73 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    @staticmethod
+    def _inbox_from_row(row):
+        return {
+            "record_id": row["record_id"],
+            "kind": row["kind"],
+            "entity_id": row["entity_id"],
+            "status": row["status"],
+            "envelope": json.loads(row["envelope"]),
+            "result": json.loads(row["result"]) if row["result"] else None,
+            "error": row["error"],
+            "attempts": int(row["attempts"]),
+            "submitted_by": row["submitted_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_inbox(self, record_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM offline_inbox WHERE record_id = ?", (record_id,)
+            ).fetchone()
+        return self._inbox_from_row(row) if row else None
+
+    def get_inbox_conn(self, connection, record_id):
+        row = connection.execute(
+            "SELECT * FROM offline_inbox WHERE record_id = ?", (record_id,)
+        ).fetchone()
+        return self._inbox_from_row(row) if row else None
+
+    def list_inbox(self, status=None):
+        with self._connect() as connection:
+            if status:
+                rows = connection.execute(
+                    "SELECT * FROM offline_inbox WHERE status = ? ORDER BY created_at, record_id",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM offline_inbox ORDER BY created_at, record_id"
+                ).fetchall()
+        return [self._inbox_from_row(row) for row in rows]
+
+    def insert_inbox(self, connection, record_id, kind, entity_id, status, envelope, actor_id):
+        now = utcnow()
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO offline_inbox(record_id, kind, entity_id, status, envelope, "
+            "result, error, attempts, submitted_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?)",
+            (record_id, kind, entity_id, status, json.dumps(envelope, ensure_ascii=False, sort_keys=True),
+             actor_id, now, now),
+        )
+        return cursor.rowcount == 1
+
+    def update_inbox(self, connection, record_id, status, entity_id=None, result=None, error=None):
+        connection.execute(
+            "UPDATE offline_inbox SET status = ?, entity_id = COALESCE(?, entity_id), "
+            "result = ?, error = ?, attempts = attempts + 1, updated_at = ? WHERE record_id = ?",
+            (
+                status,
+                entity_id,
+                json.dumps(result, ensure_ascii=False, sort_keys=True) if result is not None else None,
+                error,
+                utcnow(),
+                record_id,
+            ),
+        )
 
     def ping(self):
         with self._connect() as connection:

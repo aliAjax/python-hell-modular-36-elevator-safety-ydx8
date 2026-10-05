@@ -126,16 +126,25 @@ def _complete_rescue(actor, entity, data, lookup):
     return {"resolved_by": actor.user_id}
 
 
+def _resolve_sync_conflict(actor, entity, data, lookup):
+    if data.get("choice") not in ("field", "server"):
+        raise ValidationError("choice must be 'field' or 'server'")
+    return {
+        "resolved_by": actor.user_id,
+        "resolved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
 class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "sync_conflicts": "sync_conflict",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "sync_conflict": "open",
     }
     TRANSITIONS = {
         "equipment": {
@@ -175,6 +184,9 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "sync_conflict": {
+            "resolve": (("open",), "resolved"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
@@ -193,6 +205,7 @@ class RuleEngine:
         ("remediation", "submit_evidence"): ("evidence",),
         ("alarm", "resolve"): ("resolution",),
         ("permit", "revoke"): ("reason",),
+        ("sync_conflict", "resolve"): ("choice",),
     }
     CREATE_ROLES = {
         "equipment": ("admin", "inspector"),
@@ -225,6 +238,7 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+        ("sync_conflict", "resolve"): ("admin",),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
@@ -239,6 +253,7 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("sync_conflict", "resolve"): _resolve_sync_conflict,
     }
 
     def normalize_kind(self, kind):
